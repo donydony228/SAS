@@ -1,0 +1,15 @@
+# Large competition data files
+data/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Jupyter
+.virtual_documents/

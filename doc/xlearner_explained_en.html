@@ -1,0 +1,493 @@
+<h1 id="x-learner-complete-explanation">X-Learner: Complete Explanation</h1>
+<h2 id="why-do-we-need-x-learner">1. Why Do We Need X-Learner?</h2>
+<h3 id="background">Background</h3>
+<p>Our goal is simple: <strong>decide who to contact in order to maximize the net profit of the fundraising campaign.</strong></p>
+<p>Intuitively, the best strategy is to “only contact people who donate more because they were contacted.” But there is a fundamental problem:</p>
+<blockquote>
+<p>For each person, we can only observe either the outcome <em>with</em> contact or the outcome <em>without</em> contact — <strong>never both at the same time</strong>.</p>
+</blockquote>
+<p>This is known as the <strong>Counterfactual Problem</strong> in causal inference.</p>
+<hr />
+<h3 id="the-reality-of-training-data">The Reality of Training Data</h3>
+<p>In R2_TRAIN, 100K people are split into two groups:</p>
+<table>
+<colgroup>
+<col style="width: 26%" />
+<col style="width: 23%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Group</th>
+<th>Size</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Contact=0 (not contacted)</td>
+<td>89,886</td>
+<td>Large group, but never contacted</td>
+</tr>
+<tr class="even">
+<td>Contact=1 (contacted)</td>
+<td>10,114</td>
+<td>Small group, but we have post-contact outcomes</td>
+</tr>
+</tbody>
+</table>
+<p>The problem: <strong>Contact=1 has only 10K records. Training a “post-contact behavior model” on 10K samples is prone to severe overfitting.</strong></p>
+<p>We tested T-Learner (which trains separate models for each group), and M1’s Holdout AUC was only 0.59 — barely better than random guessing.</p>
+<hr />
+<h2 id="the-core-idea-of-x-learner">2. The Core Idea of X-Learner</h2>
+<p><strong>Borrow strength from the large group (89K) to better understand the small group (10K).</strong></p>
+<p>For each contacted person, we ask:</p>
+<blockquote>
+<p>“What would this person have donated <em>without</em> being contacted?”</p>
+</blockquote>
+<p>We don’t have this answer directly, but we can estimate it using the model trained on the 89K uncontacted people. This estimate is far more stable than anything learned from 10K samples alone.</p>
+<hr />
+<h2 id="four-steps-in-detail">3. Four Steps in Detail</h2>
+<h3 id="step-1-train-two-base-models">Step 1: Train Two Base Models</h3>
+<p>Split the data by Contact and train one model per group:</p>
+<p><strong>M0 (Control Model)</strong> - Training data: 71,872 people with Contact=0 (80% train split) - Features: demographics + donation history (19 features, <strong>Contact excluded</strong>) - Target: <code>GaveThisYear</code> (0 or 1) - Meaning: “Given no contact, how likely is this person to donate?” - Result: Holdout AUC = 0.6615 (stable due to large sample size)</p>
+<p><strong>M1 (Treatment Model)</strong> - Training data: 8,128 people with Contact=1 (80% train split) - Features: same 19 features (<strong>Contact excluded</strong>) - Target: <code>GaveThisYear</code> (0 or 1) - Meaning: “After being contacted, how likely is this person to donate?” - Result: Holdout AUC = 0.5901 (unstable due to small sample — this is exactly what X-Learner addresses)</p>
+<hr />
+<h3 id="step-2-compute-pseudo-outcomes">Step 2: Compute Pseudo Outcomes</h3>
+<p>This is the most important and innovative step.</p>
+<p><strong>For contacted people (Contact=1): compute D1</strong></p>
+<pre><code>D1 = Actual outcome (Y1) − M0&#39;s predicted probability of donating without contact</code></pre>
+<p>Plain English: - M0 says: “If this person hadn’t been contacted, there’s a 20% chance they’d donate” - The person was actually contacted and donated (Y1 = 1) - D1 = 1 − 0.20 = <strong>+0.80</strong> (being contacted caused them to donate 80% more than expected → strong Persuadable signal)</p>
+<table>
+<colgroup>
+<col style="width: 52%" />
+<col style="width: 47%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>D1 value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>D1 &gt; 0</td>
+<td>Contact caused this person to donate more than expected → Persuadable signal</td>
+</tr>
+<tr class="even">
+<td>D1 ≈ 0</td>
+<td>Contact had no effect → Lost Cause</td>
+</tr>
+<tr class="odd">
+<td>D1 &lt; 0</td>
+<td>Contact caused this person to donate <em>less</em> than expected → Sleeping Dog signal</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Why is this meaningful?</strong> M0 was trained on 89K people and provides a reliable counterfactual baseline. D1 is not computed from the 10K alone — it leverages M0’s stable estimate, bypassing the small-sample problem.</p>
+<hr />
+<p><strong>For uncontacted people (Contact=0): compute D0</strong></p>
+<pre><code>D0 = M1&#39;s predicted probability if contacted − Actual outcome (Y0)</code></pre>
+<p>Plain English: - M1 says: “If we contacted this person, there’s a 40% chance they’d donate” - The person was not contacted and did not donate (Y0 = 0) - D0 = 0.40 − 0 = <strong>+0.40</strong> (contacting them would increase donation probability by 40%)</p>
+<hr />
+<h3 id="step-3-train-cate-estimators">Step 3: Train CATE Estimators</h3>
+<p>After Step 2, we have: - D1 values for each of the 10K contacted people - D0 values for each of the 90K uncontacted people</p>
+<p>But at scoring time, we need to estimate Uplift for <strong>100K completely new people</strong>. So we train two “Uplift predictors”:</p>
+<p><strong>τ1 (Uplift predictor from the treated group’s perspective)</strong> - Training data: 8,128 Contact=1 people - Features: same 19 features - Target: <strong>D1</strong> (a continuous Uplift value, not a binary label) - Meaning: for a new person, estimate their individual treatment effect from the treatment group’s perspective - Result: Train R² = 0.3139 (much better than the ~0 R² from the regression model, because D1 incorporates M0’s counterfactual information)</p>
+<p><strong>τ0 (Uplift predictor from the control group’s perspective)</strong> - Training data: 71,872 Contact=0 people - Features: same 19 features - Target: <strong>D0</strong> - Meaning: for a new person, estimate their individual treatment effect from the control group’s perspective - Result: Train R² = 0.2450</p>
+<hr />
+<h3 id="step-4-propensity-score-weighted-combination">Step 4: Propensity Score Weighted Combination</h3>
+<p>We now have two Uplift estimates. Which one should we trust more?</p>
+<p>The issue: Contact=1 people were <strong>not randomly selected</strong>. People with prior donation history or higher engagement were more likely to be contacted in the first place. This creates selection bias between the two groups.</p>
+<p>Solution: train a <strong>Propensity Score model</strong> g(x):</p>
+<p><strong>Propensity Score Model</strong> - Training data: all 80,000 people (train split) - Features: same 19 features - Target: <code>Contact</code> (0 or 1) - Meaning: “Given this person’s features, how likely were they to be contacted?” - Result: Train AUC = 0.7210 (confirms Contact is not randomly assigned, so PS weighting is meaningful)</p>
+<p>Use g(x) to determine the weighting:</p>
+<pre><code>Final CATE = g(x) × τ0(x) + (1 − g(x)) × τ1(x)</code></pre>
+<table>
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 34%" />
+<col style="width: 42%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>g(x)</th>
+<th>Meaning</th>
+<th>Weighting</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>High (e.g., 0.8)</td>
+<td>This person closely resembles those who tend to get contacted</td>
+<td>Trust τ0 more (control group perspective is more neutral)</td>
+</tr>
+<tr class="even">
+<td>Low (e.g., 0.1)</td>
+<td>This person rarely gets contacted</td>
+<td>Trust τ1 more (treatment group perspective is more relevant)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="all-models-at-a-glance">4. All Models at a Glance</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Model</th>
+<th>Training Data</th>
+<th># Features</th>
+<th>Target</th>
+<th>Algorithm</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>M0</td>
+<td>Contact=0, 71,872 people</td>
+<td>19</td>
+<td>GaveThisYear (0/1)</td>
+<td>GBM (Optuna best params)</td>
+</tr>
+<tr class="even">
+<td>M1</td>
+<td>Contact=1, 8,128 people</td>
+<td>19</td>
+<td>GaveThisYear (0/1)</td>
+<td>GBM</td>
+</tr>
+<tr class="odd">
+<td>τ0</td>
+<td>Contact=0, 71,872 people</td>
+<td>19</td>
+<td>D0 (continuous)</td>
+<td>GBM</td>
+</tr>
+<tr class="even">
+<td>τ1</td>
+<td>Contact=1, 8,128 people</td>
+<td>19</td>
+<td>D1 (continuous)</td>
+<td>GBM</td>
+</tr>
+<tr class="odd">
+<td>Propensity</td>
+<td>Full sample, 80,000 people</td>
+<td>19</td>
+<td>Contact (0/1)</td>
+<td>GBM</td>
+</tr>
+</tbody>
+</table>
+<p>Hyperparameters (same for all models, from Optuna search): - n_estimators=375, max_depth=6, learning_rate=0.0129 - subsample=0.604, min_samples_leaf=45</p>
+<hr />
+<h2 id="the-19-features">5. The 19 Features</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Feature</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Woman</td>
+<td>Gender (0/1)</td>
+</tr>
+<tr class="even">
+<td>Age</td>
+<td>Age</td>
+</tr>
+<tr class="odd">
+<td>Salary</td>
+<td>Annual salary</td>
+</tr>
+<tr class="even">
+<td>SeniorList</td>
+<td>Senior list membership</td>
+</tr>
+<tr class="odd">
+<td>NbActivities</td>
+<td>Number of activities attended</td>
+</tr>
+<tr class="even">
+<td>Referrals</td>
+<td>Number of referrals made</td>
+</tr>
+<tr class="odd">
+<td>Recency</td>
+<td>Months since last donation</td>
+</tr>
+<tr class="even">
+<td>Frequency</td>
+<td>Number of past donations</td>
+</tr>
+<tr class="odd">
+<td>Seniority</td>
+<td>Years of membership</td>
+</tr>
+<tr class="even">
+<td>TotalGift</td>
+<td>Total cumulative donation amount</td>
+</tr>
+<tr class="odd">
+<td>MinGift</td>
+<td>Smallest single donation</td>
+</tr>
+<tr class="even">
+<td>MaxGift</td>
+<td>Largest single donation</td>
+</tr>
+<tr class="odd">
+<td>GaveLastYear</td>
+<td>Donated last year (0/1)</td>
+</tr>
+<tr class="even">
+<td>AmtLastYear</td>
+<td>Donation amount last year</td>
+</tr>
+<tr class="odd">
+<td>Education_High School</td>
+<td>High school education (one-hot)</td>
+</tr>
+<tr class="even">
+<td>Education_University / College</td>
+<td>University/college education (one-hot)</td>
+</tr>
+<tr class="odd">
+<td>City_Downtown</td>
+<td>Lives downtown (one-hot)</td>
+</tr>
+<tr class="even">
+<td>City_Rural</td>
+<td>Lives in rural area (one-hot)</td>
+</tr>
+<tr class="odd">
+<td>City_Suburban</td>
+<td>Lives in suburbs (one-hot)</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>⚠️ <strong>Contact is NOT a feature</strong>: X-Learner handles Contact through group splitting and counterfactual estimation, not as an input feature.</p>
+</blockquote>
+<hr />
+<h2 id="scoring-pipeline">6. Scoring Pipeline</h2>
+<p>After training all 5 models, we score 100K new people in the SCOREDATA:</p>
+<pre><code>1. X = preprocess(SCOREDATA)          ← compute 19 features
+2. g  = Propensity.predict(X)          ← each person&#39;s propensity to be contacted
+3. t1 = τ1.predict(X)                  ← Uplift from treatment group perspective
+4. t0 = τ0.predict(X)                  ← Uplift from control group perspective
+5. CATE = g × t0 + (1 − g) × t1       ← weighted combination
+6. uplift_dollar = CATE × $67.25       ← multiply by donor mean to convert to dollar terms
+7. if uplift_dollar &gt; contact_cost → add to contact list</code></pre>
+<hr />
+<h2 id="results">7. Results</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Validation strategy efficiency</td>
+<td><strong>84.9%</strong> (vs 70.3% for GBM Single Model)</td>
+</tr>
+<tr class="even">
+<td>SCOREDATA Persuadables</td>
+<td><strong>60,000 people</strong></td>
+</tr>
+<tr class="odd">
+<td>Estimated cost</td>
+<td>$300,000 (60K × $5, right at the cost tier boundary)</td>
+</tr>
+<tr class="even">
+<td>Leaderboard Surplus</td>
+<td><strong>$8,718,670</strong> (best overall)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="x-learner-vs-level-2-single-model">8. X-Learner vs Level 2 Single Model</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 48%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Dimension</th>
+<th>Level 2 Single Model</th>
+<th>X-Learner</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>How Contact is handled</strong></td>
+<td>Treated as a regular feature; model learns a global Contact effect</td>
+<td>Group splitting + counterfactual estimation; individual-level Uplift</td>
+</tr>
+<tr class="even">
+<td><strong>Question asked</strong></td>
+<td>“What is this person’s donation rate <em>when</em> contacted?”</td>
+<td>“<strong>How much more</strong> does this person donate <em>because of</em> contact?”</td>
+</tr>
+<tr class="odd">
+<td><strong>Class imbalance</strong></td>
+<td>Contact=1 is only 10%, signal diluted by 90%</td>
+<td>Large group (90K) knowledge borrowed to support small group (10K)</td>
+</tr>
+<tr class="even">
+<td><strong>Number of models</strong></td>
+<td>2 (classifier + regressor)</td>
+<td>5 (M0+M1+τ0+τ1+Propensity)</td>
+</tr>
+<tr class="odd">
+<td><strong>Individualization</strong></td>
+<td>Low (all people share the same Contact effect estimate)</td>
+<td>High (each person has their own D1/D0 → τ estimate)</td>
+</tr>
+<tr class="even">
+<td><strong>Validation efficiency</strong></td>
+<td>70.3%</td>
+<td><strong>84.9%</strong></td>
+</tr>
+<tr class="odd">
+<td><strong>Leaderboard Surplus</strong></td>
+<td>$8,688,900</td>
+<td><strong>$8,718,670</strong></td>
+</tr>
+<tr class="even">
+<td><strong>Difference</strong></td>
+<td>—</td>
+<td><strong>+$29,770 (+0.34%)</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="the-fundamental-difference-in-how-uplift-is-computed">The Fundamental Difference in How Uplift is Computed</h3>
+<p><strong>Level 2 Single Model:</strong></p>
+<pre><code>One model, predict twice, take the difference
+
+Model input [x, Contact=1] → P1
+Model input [x, Contact=0] → P0
+Uplift = P1 − P0</code></pre>
+<p>Contact is just an ordinary feature. The model learns a <strong>global rule</strong>: “people with Contact=1 donate at a rate 22% higher than those with Contact=0” — applied roughly the same way to everyone.</p>
+<p><strong>X-Learner:</strong></p>
+<pre><code>No Contact feature. Instead, use counterfactual differences to directly
+estimate each person&#39;s individual treatment effect.
+
+D1 = actual outcome (with contact) − estimated outcome (without contact, via M0)
+D0 = estimated outcome (with contact, via M1) − actual outcome (without contact)
+CATE = Uplift estimator trained on D1/D0</code></pre>
+<p>Each person’s D1/D0 is computed based on their own situation, not a global rule.</p>
+<hr />
+<h3 id="side-by-side-example-same-person-two-approaches">Side-by-Side Example: Same Person, Two Approaches</h3>
+<p>Assume: “55-year-old female, AmtLastYear=$0, NbActivities=2”</p>
+<p><strong>Level 2 Single Model:</strong></p>
+<pre><code>1. Feed into model with Contact=1 → P1 = 0.35 (35% donation rate)
+2. Feed into model with Contact=0 → P0 = 0.13 (13% donation rate)
+3. Uplift_prob = 0.35 − 0.13 = 0.22
+4. Uplift_dollar = 0.22 × E_amount_model  (model also predicts donation amount)</code></pre>
+<p><strong>X-Learner:</strong></p>
+<pre><code>1. M0 (trained on 89K control group) predicts her donation rate without contact = 0.15
+2. She was actually contacted and donated (Y1 = 1)
+   → D1 = 1 − 0.15 = +0.85 (contact caused 85% more than expected)
+3. τ1 learns: for people with these features, CATE ≈ 0.18 after contact
+4. Final CATE = 0.18 (after Propensity Score weighting)</code></pre>
+<p><strong>Converting to dollar terms and making the contact decision:</strong></p>
+<p>X-Learner multiplies CATE by the <strong>mean donation amount across all donors</strong> ($67.25):</p>
+<pre><code>uplift_dollar = CATE × $67.25
+             = 0.18 × $67.25
+             = $12.11  &gt;  contact cost $5 → Add to contact list (Persuadable)</code></pre>
+<table>
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 34%" />
+<col style="width: 42%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Step</th>
+<th>Level 2</th>
+<th>X-Learner</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Number of classifiers</td>
+<td>1 (Contact is a feature)</td>
+<td>2 (M0 + M1, separately trained)</td>
+</tr>
+<tr class="even">
+<td>Uplift estimation</td>
+<td>Same model predicts twice, take diff</td>
+<td>D1/D0 counterfactuals → τ estimators</td>
+</tr>
+<tr class="odd">
+<td>Amount estimation</td>
+<td>Regression model predicts E(amt)</td>
+<td>Fixed donor mean $67.25</td>
+</tr>
+<tr class="even">
+<td>Final Uplift</td>
+<td>P_diff × E_amt</td>
+<td>CATE × $67.25</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="why-use-the-full-mean-67.25-instead-of-a-trimmed-mean">Why Use the Full Mean $67.25 Instead of a Trimmed Mean?</h3>
+<p>Donor amounts are heavily right-skewed (median $25, mean $67, max $10,000). We ran experiments with trimmed means:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Cutoff</th>
+<th>Mean</th>
+<th>People Selected</th>
+<th>Validation Surplus</th>
+<th>Efficiency</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>No trimming (adopted)</strong></td>
+<td><strong>$67.25</strong></td>
+<td><strong>14,878</strong></td>
+<td><strong>$147,240</strong></td>
+<td><strong>84.9%</strong></td>
+</tr>
+<tr class="even">
+<td>Remove top 1% (&gt;$750)</td>
+<td>$49.25</td>
+<td>13,910</td>
+<td>$139,040</td>
+<td>80.2%</td>
+</tr>
+<tr class="odd">
+<td>Remove top 5% (&gt;$200)</td>
+<td>$36.46</td>
+<td>12,537</td>
+<td>$126,520</td>
+<td>73.0%</td>
+</tr>
+<tr class="even">
+<td>Remove top 10% (&gt;$100)</td>
+<td>$31.03</td>
+<td>11,640</td>
+<td>$122,355</td>
+<td>70.6%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Conclusion: more trimming → lower Surplus.</strong> Although large donors ($750+) represent only 1% of cases, their contributions are real and should not be excluded. The arithmetic mean is the correct statistic for expected value calculations.</p>
+<hr />
+<h3 id="in-one-sentence">In One Sentence</h3>
+<blockquote>
+<p>Level 2 asks: “How likely is this person to donate when contacted?”</p>
+<p>X-Learner asks: “<strong>How much more does this person donate because they were contacted? Is that increment worth the $5 contact cost?</strong>”</p>
+<p>The latter question directly targets the business objective.</p>
+</blockquote>
